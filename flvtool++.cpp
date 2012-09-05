@@ -151,6 +151,7 @@ int main(int argc, char* argv[]) {
     char* tag_stream_start = fptr; // save this ptr
 
     size_t total_audio = 0, total_video = 0;
+    uint32_t first_keyframe_timestamp = 0;
     uint32_t last_timestamp = 0;
     bool have_audio_params = false, have_video_params = false;
     bool hasKeyframes = false;
@@ -205,6 +206,9 @@ int main(int argc, char* argv[]) {
         char frame_type = (codec_id_and_frame_type >> 4) & 0x0f;
         if (frame_type == 1) { // Keyframe
           hasKeyframes = true;
+          if (!keyframe_count) {
+            first_keyframe_timestamp = tag_timestamp;
+          }
           ++keyframe_count;
         }
         if (! have_video_params) {
@@ -355,8 +359,12 @@ int main(int argc, char* argv[]) {
 didnt_get_video_params:
         //printf("Video frame: length 0x%x bytes. Codec: %s. Type: %s.\n", tag_length - 1, codec, frame);
         fptr += (tag_length - 1); // (we already ate the codec_id_and_tag_type byte)
-        total_video += (tag_length - 1); // accumulate video byte count, minus the codec_id_and_tag_type byte
-        ++vframe_count;
+
+        // remove frames before the first keyframe from the frame count / size total, since we'll be dropping them
+        if (keyframe_count) {
+          total_video += (tag_length - 1); // accumulate video byte count, minus the codec_id_and_tag_type byte
+          ++vframe_count;
+        }
       }
 
       /*
@@ -412,7 +420,11 @@ didnt_get_video_params:
         }
  
         fptr += (tag_length - 1); // skip rest of audio except for the format byte that we ate
-        total_audio += (tag_length); // accumulate audio byte count
+
+        // remove frames before the first keyframe from the frame count / size total, since we'll be dropping them
+        if (keyframe_count) {
+          total_audio += (tag_length); // accumulate audio byte count
+        }
       }
       else {
         if (tag_length > 0) {
@@ -424,7 +436,7 @@ didnt_get_video_params:
       } 
       fptr += 4; // skip length postfix
     }
-    double length_sec = (double)last_timestamp / 1000.0;
+    double length_sec = (double)(last_timestamp - first_keyframe_timestamp) / 1000.0;
     double videodatarate = (((double)total_video * 8.0) / 1000.0) / length_sec;
     double audiodatarate = (((double)total_audio * 8.0) / 1000.0) / length_sec;
     double framerate = (double)(vframe_count)/length_sec;
@@ -436,12 +448,16 @@ didnt_get_video_params:
     onMetaData->dmap["duration"] = shared_ptr<AMFData>(new AMFDouble(length_sec));
     onMetaData->dmap["framerate"] = shared_ptr<AMFData>(new AMFDouble(framerate));
     onMetaData->dmap["videodatarate"] = shared_ptr<AMFData>(new AMFDouble(videodatarate));
-    onMetaData->dmap["audiodatarate"] = shared_ptr<AMFData>(new AMFDouble(audiodatarate));
+    // TODO writing audiodatarate sometimes results in a fle that does not play back correctly
+    // (ends early) in libavcodec/libavformat based players. This field does not appear
+    // in the FLV format specification anyway, so who knows if the flash player even
+    // cares about it.
+    //onMetaData->dmap["audiodatarate"] = shared_ptr<AMFData>(new AMFDouble(audiodatarate));
     onMetaData->dmap["videosize"] = shared_ptr<AMFData>(new AMFDouble(total_video));
     onMetaData->dmap["audiosize"] = shared_ptr<AMFData>(new AMFDouble(total_audio));
     onMetaData->dmap["hasKeyframes"] = shared_ptr<AMFData>(new AMFBoolean(hasKeyframes));
     onMetaData->dmap["totalframes"] = shared_ptr<AMFData>(new AMFDouble(vframe_count));
-    onMetaData->dmap["lasttimestamp"] = shared_ptr<AMFData>(new AMFDouble((double)last_timestamp / 1000.0));
+    onMetaData->dmap["lasttimestamp"] = shared_ptr<AMFData>(new AMFDouble(length_sec));
     onMetaData->dmap["datasize"] = shared_ptr<AMFData>(new AMFDouble(0)); // backpatch this
 
     if (! outFilename) {
@@ -513,13 +529,17 @@ didnt_get_video_params:
     // Copy tags from input to output file, making note of keyframe tag positions and timestamps
     fptr = tag_stream_start;
     uint32_t current_keyframe = 0;
+    bool got_first_keyframe = false;
+    uint32_t discarded_video_frame_prekeyframe_count = 0; // number of frames discarded before encountering the first keyframe
+    uint32_t discarded_audio_frame_prekeyframe_count = 0; // audio frames discarded
     last_timestamp = 0; // reset for fixing missing timestampextended field
     while (fptr < fend) {
       const char* tag_start = fptr;
       char tag_type = *(fptr++);
       uint32_t tag_length = deserialize_uint24(fptr);
-      uint32_t tag_timestamp = process_timestamp(tag_type, fptr, last_timestamp);
+      int32_t tag_timestamp = std::max<int32_t>(process_timestamp(tag_type, fptr, last_timestamp) - first_keyframe_timestamp, 0);
       uint32_t streamID = deserialize_uint24(fptr);
+      bool skip_frame_before_first_keyframe = false;
 
       if (tag_type == 9) { // video
         // Frame types: 1 = Keyframe, 2 = IFrame, 3 = Disposable IFrame
@@ -529,10 +549,19 @@ didnt_get_video_params:
           keyTimes->dmap[current_keyframe] = shared_ptr<AMFData>(new AMFDouble((double)tag_timestamp / 1000.0));
           keyPositions->dmap[current_keyframe] = shared_ptr<AMFData>(new AMFDouble(fp.tell()));
           ++current_keyframe;
+          got_first_keyframe = true;
+        } else if (!got_first_keyframe) {
+          ++discarded_video_frame_prekeyframe_count;
+          skip_frame_before_first_keyframe = true;
+        }
+      } else if (tag_type == 8) {
+        if (!got_first_keyframe) {
+          ++discarded_audio_frame_prekeyframe_count;
+          skip_frame_before_first_keyframe = true;
         }
       }
 
-    if ((tag_type == 8 && tag_length > 0) || tag_type == 9 || (tag_type == 18 && (!nometapackets))) {
+    if ((!skip_frame_before_first_keyframe) && ((tag_type == 8 && tag_length > 0) || tag_type == 9 || (tag_type == 18 && (!nometapackets)))) {
         // Write AUDIO/VIDEO/META tag header
         fp.putc(tag_type); // type
         fp.write_u24_be(tag_length); // length
@@ -544,6 +573,8 @@ didnt_get_video_params:
       } else {
         if ((fptr + tag_length + 4) > fend) {
           printf("SEVERE: Unknown tag at 0x%zx of %u bytes extends past the end of the file; stopping tag copy here.\n", (size_t)(tag_start - infile.fbase), tag_length);
+        } else if (skip_frame_before_first_keyframe) {
+          // Don't emit a warning for every skipped initial Iframe
         } else if (tag_length > 0) {
           printf("WARNING: Skipping unknown tag type %u (%u bytes, timestamp %u ms) at file offset 0x%zx\n", tag_type & 0xff, tag_length, tag_timestamp, (size_t)(tag_start - infile.fbase));
         } else {
@@ -567,6 +598,9 @@ didnt_get_video_params:
     fp.close();
     rename(outFilename_tmp.c_str(), outFilename);
 
+    if (discarded_video_frame_prekeyframe_count) {
+      printf("WARNING: Discarded %u video IFrames and %u associated audio frames before encountering the first keyframe; stream timestamps offset by %ums.\n", discarded_video_frame_prekeyframe_count, discarded_audio_frame_prekeyframe_count, first_keyframe_timestamp);
+    }
     printf("Total: %lu video bytes (%f kbps), %lu audio bytes (%f kbps), %f seconds long\n", total_video, videodatarate, total_audio, audiodatarate, length_sec);
     if (! nodump) {
       printf("Final onMetaData tag contents: %s\n", onMetaData->asString().c_str());
