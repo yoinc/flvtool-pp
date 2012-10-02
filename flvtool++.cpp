@@ -61,6 +61,7 @@ int main(int argc, char* argv[]) {
     printf("  -nometapackets: do not copy extra metadata packets from the input file (besides the initial onMetaData packet)\n");
     printf("  -strip: do not emit any metadata to the output file; implies -nometapackets\n");
     printf("  -tag name value: Set a metadata tag named 'name' to the (string) value 'value'\n");
+    printf("  -nonormalizetimestamps: do not subtract the timestamp of the first keyframe from every frame timestamp\n");
     printf("Note that manually set tags will override automatically generated tags.\n");
     return -1;
   }
@@ -72,6 +73,7 @@ int main(int argc, char* argv[]) {
   bool nodump = false;
   bool nometapackets = false;
   bool strip = false;
+  bool nonormalizetimestamps = false;
   list<pair<string, string> > extra_tags;
 
   for (int i = 1; i < argc; ++i) {
@@ -92,6 +94,9 @@ int main(int argc, char* argv[]) {
       string tn = argv[++i];
       string tv = argv[++i];
       extra_tags.push_back(std::make_pair(tn, tv));
+    }
+    else if (strcmp(argv[i], "-nonormalizetimestamps") == 0) {
+      nonormalizetimestamps = true;
     }
     else if (! filename) {
       filename = argv[i];
@@ -436,7 +441,12 @@ didnt_get_video_params:
       } 
       fptr += 4; // skip length postfix
     }
-    double length_sec = (double)(last_timestamp - first_keyframe_timestamp) / 1000.0;
+    double length_sec;
+    if (! nonormalizetimestamps) {
+      length_sec = (double)(last_timestamp - first_keyframe_timestamp) / 1000.0;
+    } else {
+      length_sec = (double)last_timestamp / 1000.0;
+    }
     double videodatarate = (((double)total_video * 8.0) / 1000.0) / length_sec;
     double audiodatarate = (((double)total_audio * 8.0) / 1000.0) / length_sec;
     double framerate = (double)(vframe_count)/length_sec;
@@ -537,7 +547,14 @@ didnt_get_video_params:
       const char* tag_start = fptr;
       char tag_type = *(fptr++);
       uint32_t tag_length = deserialize_uint24(fptr);
-      int32_t tag_timestamp = std::max<int32_t>(process_timestamp(tag_type, fptr, last_timestamp) - first_keyframe_timestamp, 0);
+
+      int32_t tag_timestamp;
+      if (! nonormalizetimestamps) {
+        tag_timestamp = std::max<int32_t>(process_timestamp(tag_type, fptr, last_timestamp) - first_keyframe_timestamp, 0);
+      } else {
+        tag_timestamp = process_timestamp(tag_type, fptr, last_timestamp);
+      }
+
       uint32_t streamID = deserialize_uint24(fptr);
       bool skip_frame_before_first_keyframe = false;
 
