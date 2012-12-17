@@ -32,7 +32,7 @@ uint32_t process_timestamp(char tag_type, char*& fptr, uint32_t& last_timestamp)
   uint32_t tag_timestamp = deserialize_uint24(fptr);
   tag_timestamp |= ((*(fptr++)) & 0xff) << 24; // add upper 8 bits of the timestamp field from TimestampExtended
 
-  if (tag_timestamp < last_timestamp) {
+  if (tag_timestamp <= last_timestamp) {
     if (((tag_timestamp & 0xff000000) == 0) && (last_timestamp & 0xfff00000)) {
       // Looks like the file doesn't have the TimestampExtended field properly set.
       if (! timestamp_warning_given) {
@@ -43,10 +43,12 @@ uint32_t process_timestamp(char tag_type, char*& fptr, uint32_t& last_timestamp)
       if (new_timestamp < last_timestamp) new_timestamp += 0x1000000;
       tag_timestamp = new_timestamp;
       assert(tag_timestamp >= last_timestamp);
+    } else if (tag_timestamp == last_timestamp && (tag_type == 9 || tag_type == 8)) {
+      printf("shitfuckfuckshit\n");
+      tag_timestamp = last_timestamp + 1;
     } else {
       if (! timestamp_warning_given && (tag_type == 9 || tag_type == 18)) { // don't warn on tags that aren't video or audio...
         printf("WARNING: File has discontiguous timestamps that we don't know how to fix.\n");
-        timestamp_warning_given = true;
       }
     }
   }
