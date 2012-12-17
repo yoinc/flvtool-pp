@@ -12,6 +12,13 @@
 #include "serialized_buffer.h"
 #include "bitstream.h"
 
+char magic_bad_adcr[] =
+  { 0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x42, 0x00
+  , 0x0d, 0xff, 0xe1, 0x00, 0x2e, 0x67, 0x42, 0x80
+  , 0x0d, 0x96, 0x54, 0x0a, 0x0f, 0xd8, 0x0a, 0x84
+  , 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03
+  };
+
 inline uint32_t deserialize_uint24(char*& ptr) {
   uint32_t d = ((*(ptr++)) & 0xff) << 16;
   d += ((*(ptr++)) & 0xff) << 8;
@@ -578,7 +585,30 @@ didnt_get_video_params:
         }
       }
 
-    if ((!skip_frame_before_first_keyframe) && ((tag_type == 8 && tag_length > 0) || tag_type == 9 || (tag_type == 18 && (!nometapackets)))) {
+
+      // 17 00 0000 00
+      // configuration version =
+      // 01
+      // profile indication =
+      // 42
+      // profile compat =
+      // 00
+      // alevel indic =
+      // 0d
+      // 0xe0 & lengtghsizeminusone
+      // ff
+      // e100 2e67 4280 | 0d96 540a 0fd8 0a84 | 0000 0300 0400 0003
+// 007b 8000 0800 0004 | 001f c638 c000 0400 | 0003 0200 0fe3 1c3b | 4244 d401 0004 68ce
+// 3520
+
+    static bool first_adcr = true;
+    bool is_avc_decoder_configuration_record =
+      tag_type == 9 && tag_length == 66 &&
+      0 == memcmp(fptr, magic_bad_adcr, sizeof(magic_bad_adcr) - 1);
+
+    if (!(is_avc_decoder_configuration_record && !first_adcr) &&
+        ((!skip_frame_before_first_keyframe) && ((tag_type == 8 && tag_length > 0) ||
+                                                 tag_type == 9 || (tag_type == 18 && (!nometapackets))))) {
         // Write AUDIO/VIDEO/META tag header
         fp.putc(tag_type); // type
         fp.write_u24_be(tag_length); // length
@@ -590,6 +620,8 @@ didnt_get_video_params:
       } else {
         if ((fptr + tag_length + 4) > fend) {
           printf("SEVERE: Unknown tag at 0x%zx of %u bytes extends past the end of the file; stopping tag copy here.\n", (size_t)(tag_start - infile.fbase), tag_length);
+        } else if (is_avc_decoder_configuration_record) {
+          printf("WARNING: Skipping non-first bad_avc_decoder_configuration_record\n");
         } else if (skip_frame_before_first_keyframe) {
           // Don't emit a warning for every skipped initial Iframe
         } else if (tag_length > 0) {
@@ -599,6 +631,9 @@ didnt_get_video_params:
         }
       }
 
+      if (is_avc_decoder_configuration_record) {
+        first_adcr = false;
+      }
       fptr += (tag_length + 4); // move pointer to top of next tag
     }
     // Done copying tags, regenerate & backpatch updated metadata
